@@ -1,4 +1,5 @@
 import sys
+import time
 
 import numpy as np
 from scipy.misc import imread
@@ -53,9 +54,8 @@ for i in tqdm(range(10)):
         for l in layers_style:
             while (mask.size(1) != features_naive[l].size(2)):
                 mask = torch.round(F.avg_pool2d(mask.float(), 2))
-            mask = mask.long()
             #mask = torch.round(F.avg_pool2d(mask_img, round(mask_img.size(2) / features_naive[l].size(2)))).long()
-            features_style_nearest[l] = patch_match(features_naive[l], features_style[l], mask, patch_size = 3, radius = min(mask.shape[2:]))
+            features_style_nearest[l] = patch_match(features_naive[l], features_style[l], mask, patch_size = 3, stride = 2)
         #features_style_nearest = features_style
 
         loss = 0
@@ -63,12 +63,12 @@ for i in tqdm(range(10)):
         for l in layers_content:
             while (mask.size(1) != features_naive[l].size(2)):
                 mask = F.avg_pool2d(mask.float(), 2)
-            loss += 5 * torch.mean(mask * (features_naive[l] - features_style[l].detach()) ** 2)
+            loss += 0.5 * torch.mean(mask * (features_naive[l] - features_style[l].detach()) ** 2)
         mask = mask_img.float()
         for l in layers_style:
             while (mask.size(1) != features_naive[l].size(2)):
                 mask = F.avg_pool2d(mask.float(), 2)
-            loss += 100 * torch.mean((gram_matrix(mask * features_naive[l]) - gram_matrix(mask * features_style_nearest[l]).detach()) ** 2)
+            loss += 1/6.0 * torch.mean((gram_matrix(mask * features_naive[l]) - gram_matrix(mask * features_style_nearest[l]).detach()) ** 2)
 
         net.zero_grad()
         optimizer.zero_grad()
@@ -76,6 +76,9 @@ for i in tqdm(range(10)):
         loss.backward()
         return loss
 
+    t0 = time.time()
+    closure()
+    print(time.time() - t0)
     optimizer.step(closure)
 
     out = np.transpose(naive_img.detach().squeeze().cpu().numpy(), (1, 2, 0))

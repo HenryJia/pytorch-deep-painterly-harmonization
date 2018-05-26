@@ -93,28 +93,38 @@ def gram_matrix(y):
     return gram
 
 
+def patchdot(x, y, patch_size = 3): # patchwise dot product
+    dot = torch.sum(x * y, dim = 1, keepdim = True)
+    norm = F.avg_pool2d(dot, patch_size, stride = 1, padding = patch_size // 2).squeeze(1) * patch_size ** 2
+    return norm
+
+def cosine_distance(x, y, patch_size = 3):
+    return patchdot(x, y, patch_size) / (patchdot(y, y, patch_size) * patchdot(x, x, patch_size))
+
+
 # An attempt at an efficient patch matching algorithm
-# Important Note: This function is NOT differentiable with respect to x or the mask
-def patch_match(x, y, mask, patch_size = 3, radius = 3, stride = 1):
+# Important Note: This function is NOT differentiable
+def patch_match(x, y, mask, patch_size = 3, stride = 1):
     batch, channels, height, width = x.size()
 
-    y_pad = F.pad(y, (radius // 2, radius // 2, radius // 2, radius // 2)) # Left, right, up, down
-    distance_all = []
-    for i in range(0, radius, stride): # Searching/matching in row-major order
-        for j in range(0, radius, stride):
-            distance_pix = torch.sum((y_pad[:, :, i:i + height, j:j + width] - x) ** 2, dim = 1, keepdim = True)
-            distance_all += [F.avg_pool2d(distance_pix, patch_size, stride = 1, padding = patch_size // 2)]
+    distance_min = torch.ones(batch, height, width).cuda().detach() * 1e6
+    grid_x = torch.zeros(batch, height, width).cuda().detach()
+    grid_y = torch.zeros(batch, height, width).cuda().detach()
+    for i in range(0, height, stride):
+        for j in range(0, width, stride):
+            distance = cosine_distance(y[:, :, i:, j:].detach(), x[:, :, :-i or None, :-j or None].detach(), patch_size)
 
-    distance_all = torch.cat(distance_all, dim = 1) # Thus this stack of distances will be in row major order
-    location_min = torch.argmin(distance_all, dim = 1) # get the pixel/patch with the minimal distance
-    location_min = location_min * mask # Only need to match within the mask
-    distance_min_x = torch.fmod(location_min, radius) - radius // 2 # Need to adjust to take into account searching behind
-    distance_min_y = location_min / radius - radius // 2
+            #if i > 0 or j > 0:
+                #distance = F.pad(distance, (0, j, 0, i)) # (left, right, up down)
+            is_min = (distance < distance_min[:, :-i or None, :-j or None]).float()
+            distance_min[:, :-i or None, :-j or None] = is_min * distance + (1 - is_min) * distance_min[:, :-i or None, :-j or None]
+            grid_x[:, :-i or None, :-j or None] = is_min * j + (1 - is_min) * grid_x[:, :-i or None, :-j or None]
+            grid_y[:, :-i or None, :-j or None] = is_min * i + (1 - is_min) * grid_y[:, :-i or None, :-j or None]
 
-    grid_x = torch.arange(width).cuda().unsqueeze(0).unsqueeze(0) + distance_min_x # Make our grid and use PyTorch's grid_sample
-    grid_y = torch.arange(height).cuda().unsqueeze(1).unsqueeze(0) + distance_min_y
-    grid_x = torch.clamp(grid_x.float() / width, 0, 1) * 2 - 1
-    grid_y = torch.clamp(grid_y.float() / height, 0, 1) * 2 - 1
+    grid_x = mask * grid_x.detach() + (1 - mask) * torch.arange(width).cuda().float().unsqueeze(0).unsqueeze(0)
+    grid_y = mask * grid_y.detach() + (1 - mask) * torch.arange(height).cuda().float().unsqueeze(-1).unsqueeze(0)
+    grid_x = torch.clamp(grid_x / (width - 1), 0, 1) * 2 - 1
+    grid_y = torch.clamp(grid_y / (height - 1), 0, 1) * 2 - 1
 
     grid = torch.stack([grid_x, grid_y], dim = 3) # put the grids together
     #print(grid.size(), distance_all.size(), location_min.size(), distance_min_x.size(), distance_min_y.size())
