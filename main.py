@@ -1,7 +1,9 @@
 import sys
+import time
 
 import numpy as np
 from scipy.misc import imread
+from scipy.ndimage.filters import gaussian_filter
 from PIL import Image
 
 import torch
@@ -29,55 +31,62 @@ transform = Compose([ToTensor(), Normalize(mean = [0.485, 0.456, 0.406], std = [
 
 style_img = transform(Image.open(style_fn)).unsqueeze(0).cuda()
 naive_img = transform(Image.open(naive_fn)).unsqueeze(0).cuda()
-mask_img = torch.from_numpy(np.transpose(imread(mask_fn).astype(np.float32), (2, 0, 1))).unsqueeze(0).cuda() / 255.0
+mask_img = imread(mask_fn)[..., 0].astype(np.float32)
+tmask_img = gaussian_filter(mask_img, sigma = 3)
+tmask_img = torch.from_numpy(tmask_img).unsqueeze(0).cuda() / 255.0
+mask_img = torch.from_numpy(mask_img).unsqueeze(0).cuda() / 255.0
 
-# We only want the max and not the argmax so only take the 0th output
-mask_img = torch.max(torch.ceil(mask_img), dim = 1)[0]
 naive_img.requires_grad_(True)
+naive_img_original = naive_img.clone()
 
 net = Vgg19().cuda()
 #optimizer = Adam([naive_img], lr = 1e1)
-optimizer = LBFGS([naive_img], max_iter = 100)
+optimizer = LBFGS([naive_img], max_iter = 1000)
 
 features_style = net(style_img)
+features_naive_original = net(naive_img)
 
 layers_content = ['relu4_1']
 layers_style = ['relu3_1', 'relu4_1', 'relu5_1']
 
-for i in tqdm(range(10)):
+features_style_nearest = {}
+for l in layers_style:
+    features_style_nearest[l] = patch_match(features_naive_original[l], features_style[l], patch_size = 3, radius = 1)
+#features_style_nearest = features_style
+
+for i in tqdm(range(1)):
     def closure():
         features_naive = net(naive_img)
 
-        mask = mask_img.float()
-        features_style_nearest = {}
-        for l in layers_style:
-            while (mask.size(1) != features_naive[l].size(2)):
-                mask = torch.round(F.avg_pool2d(mask.float(), 2))
-            mask = mask.long()
-            #mask = torch.round(F.avg_pool2d(mask_img, round(mask_img.size(2) / features_naive[l].size(2)))).long()
-            features_style_nearest[l] = patch_match(features_naive[l], features_style[l], mask, patch_size = 3, radius = min(mask.shape[2:]))
-        #features_style_nearest = features_style
-
-        loss = 0
-        mask = mask_img.float()
+        loss_content = 0
+        mask = mask_img
         for l in layers_content:
             while (mask.size(1) != features_naive[l].size(2)):
-                mask = F.avg_pool2d(mask.float(), 2)
-            loss += 5 * torch.mean(mask * (features_naive[l] - features_style[l].detach()) ** 2)
-        mask = mask_img.float()
+                mask = F.avg_pool2d(mask, 2)
+            loss_content += torch.mean(mask * (features_naive[l] - features_naive_original[l].detach()) ** 2)
+
+        loss_style = 0
+        mask = mask_img
         for l in layers_style:
             while (mask.size(1) != features_naive[l].size(2)):
-                mask = F.avg_pool2d(mask.float(), 2)
-            loss += 100 * torch.mean((gram_matrix(mask * features_naive[l]) - gram_matrix(mask * features_style_nearest[l]).detach()) ** 2)
+                mask = F.avg_pool2d(mask, 2)
+            gram_naive = gram_matrix(mask * features_naive[l])
+            gram_style = gram_matrix(mask * features_style_nearest[l])
+            loss_style += torch.mean((gram_naive - gram_style.detach()) ** 2)
 
+        loss_variation = torch.mean((naive_img[:, :, 1:] - naive_img[:, :, :-1]) ** 2) + torch.mean((naive_img[:, :, :, 1:] - naive_img[:, :, :, :-1]) ** 2)
+
+        loss = 5 * loss_content + 100 * loss_style + 150 * loss_variation
         net.zero_grad()
         optimizer.zero_grad()
 
         loss.backward()
+        naive_img.grad.data *= mask_img
         return loss
 
     optimizer.step(closure)
 
+    naive_img = tmask_img * naive_img + (1 - tmask_img) * naive_img_original
     out = np.transpose(naive_img.detach().squeeze().cpu().numpy(), (1, 2, 0))
     #out = (out - np.max(out)) / (np.max(out) - np.min(out))
     plt.figure()

@@ -102,43 +102,47 @@ def patchdot(x, y, patch_size = 3): # patchwise dot product
     norm = F.avg_pool2d(dot, patch_size, stride = 1, padding = patch_size // 2).squeeze(1) / patch_size ** 2
     return norm
 
-def cosine_distance(x, y, patch_size = 3):
+def cosine_similarity(x, y, patch_size = 3):
     out = patchdot(x, y, patch_size)
-    out = out / torch.sqrt(patchdot(y, y, patch_size) * patchdot(x, x, patch_size))
+    out = out / (torch.sqrt(patchdot(y, y, patch_size) * patchdot(x, x, patch_size)) + 1e-8)
     return out
 
 
 # An attempt at an efficient patch matching algorithm
 # Important Note: This function is NOT differentiable
-def patch_match(x, y, patch_size = 3, radius = 3, stride = 1):
-    batch, channels, height, width = x.size()
+# Not working, needs fixing
+def patch_match(x, y, patch_size = 3, stride = 1):
+    batch, channels, height_x, width_x = x.size()
+    batch, channels, height_y, width_y = y.size()
 
     with torch.no_grad():
-        y_pad = F.pad(y, (radius, radius, radius, radius)) # Left, right, up, down
-        distance_max = torch.zeros(batch, height, width).cuda()
-        grid_x = torch.zeros(batch, height, width).cuda().float()
-        grid_y = torch.zeros(batch, height, width).cuda().float()
-        for i in range(0, 2 * radius + 1, stride): # Searching/matching in row-major order
-            for j in range(0, 2 * radius + 1, stride):
-                distance = cosine_distance(y_pad[:, :, i:i + height, j:j + width], x)
+        similarity_max = torch.zeros(batch, height_x, width_x).cuda() - 1
+        grid_j = torch.zeros(batch, height_x, width_x).cuda().float()
+        grid_i = torch.zeros(batch, height_x, width_x).cuda().float()
 
-                is_max = (distance > distance_max).float()
-                distance_max = is_max * distance + (1 - is_max) * distance_max
-                grid_x = is_max * j + (1 - is_max) * grid_x
-                grid_y = is_max * i + (1 - is_max) * grid_y
+        y_pad = torch.cat([y, y], dim = 2)
+        y_pad = torch.cat([y_pad, y_pad], dim = 3)
 
-        print('minmax: ', torch.min(distance), torch.max(distance))
-        print('minmax_y: ', torch.min(y), torch.max(y))
-        grid_x = grid_x - radius + torch.arange(width).cuda().float().unsqueeze(0).unsqueeze(0)
-        grid_y = grid_y - radius + torch.arange(height).cuda().float().unsqueeze(-1).unsqueeze(0)
-        grid_x = torch.clamp(grid_x, 0, width)
-        grid_y = torch.clamp(grid_y, 0, height)
+        for i in range(0, height_y, stride): # Searching/matching in row-major order
+            for j in range(0, width_y, stride):
+                similarity = cosine_similarity(y_pad[:, :, i:i + height_x, j:j + width_x], x)
 
-        grid_x = torch.clamp(grid_x.float() / (width - 1), 0, 1) * 2 - 1
-        grid_y = torch.clamp(grid_y.float() / (height - 1), 0, 1) * 2 - 1
+                is_max = (similarity > similarity_max).float()
+                similarity_max = is_max * similarity + (1 - is_max) * similarity_max
+                grid_j = is_max * j + (1 - is_max) * grid_j
+                grid_i = is_max * i + (1 - is_max) * grid_i
 
-        grid = torch.stack([grid_y, grid_x], dim = 3) # put the grids together
-        #print(grid.size(), distance_all.size(), location_min.size(), distance_min_x.size(), distance_min_y.size())
+        grid_j = grid_j + torch.arange(width_y).cuda().float().unsqueeze(0).unsqueeze(0)
+        grid_i = grid_i + torch.arange(height_y).cuda().float().unsqueeze(-1).unsqueeze(0)
+
+        grid_j = grid_j % width_y
+        grid_i = grid_i % height_y
+
+        grid_j = grid_j.float() / (width_y - 1) * 2 - 1
+        grid_i = grid_i.float() / (height_y - 1) * 2 - 1
+
+        grid = torch.stack([grid_j, grid_i], dim = 3) # put the grids together
+        #print(grid.size(), similarity_all.size(), location_min.size(), similarity_min_x.size(), similarity_min_y.size())
 
         # Now I know PyTorch uses bilinear for this whereas Deep Painterly Harmonisation uses nearest neighbour sampling, but since our indices are all integers
         # it makes no difference, though bilinear is much more compute intensive, but we have GPUs so it shouldn't matter too much
